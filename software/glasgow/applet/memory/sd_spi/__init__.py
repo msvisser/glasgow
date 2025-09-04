@@ -1,11 +1,13 @@
 import contextlib
 import logging
 import struct
+import time
 from typing import Optional
 
 from amaranth import *
 from amaranth.lib import crc, enum, io, stream, wiring
 from amaranth.lib.wiring import In, Out
+
 from glasgow.abstract import AbstractAssembly, ClockDivisor, GlasgowPin
 from glasgow.applet import GlasgowAppletError, GlasgowAppletV2
 from glasgow.gateware import spi
@@ -143,12 +145,10 @@ SdCardIdentification = bitstruct(
 class SdSpiCommand(enum.Enum, shape=4):
     Select = 0
     Transfer = 1
-    Delay = 2
-    Sync = 3
-
-    WakeUp = 4
-    Command = 5
-    ReadBlock = 6
+    Sync = 2
+    WakeUp = 3
+    Command = 4
+    ReadBlock = 5
 
 
 class SdSpiControllerComponent(wiring.Component):
@@ -187,13 +187,17 @@ class SdSpiControllerComponent(wiring.Component):
         chip = Signal(range(1 + len(self._ports.cs)))
         mode = Signal(spi.Mode)
         is_put = mode.as_value().matches(spi.Mode.Put, spi.Mode.Swap)
-        is_get = mode.as_value().matches(
-            spi.Mode.Get, spi.Mode.Swap
-        )  # FIXME: amaranth-lang/amaranth#1462
+        is_get = mode.as_value().matches(spi.Mode.Get, spi.Mode.Swap)  # FIXME: amaranth-lang/amaranth#1462
         o_count = Signal(16)
         i_count = Signal(16)
-        timer = Signal(range(self._us_cycles))
+
         should_tx = Signal()
+        pending_tx = Signal()
+        pending_rx = Signal()
+        command_response_length = Signal(4)
+        success = Signal()
+
+        wait_for_ready_count = Signal(16)
 
         with m.FSM():
             with m.State("Read-Command"):
@@ -207,17 +211,18 @@ class SdSpiControllerComponent(wiring.Component):
                         with m.Case(SdSpiCommand.Transfer):
                             m.d.sync += mode.eq(self.i_stream.payload[:4])
                             m.next = "Read-Count-0:8"
-                        with m.Case(SdSpiCommand.Delay):
-                            m.next = "Read-Count-0:8"
                         with m.Case(SdSpiCommand.Sync):
                             m.next = "Sync"
                         with m.Case(SdSpiCommand.WakeUp):
                             m.next = "Read-Count-0:8"
                         with m.Case(SdSpiCommand.Command):
-                            m.d.sync += o_count.eq(8)
-                            m.d.sync += i_count.eq(8)
                             m.d.sync += should_tx.eq(1)
+                            m.d.sync += wait_for_ready_count.eq(8)
+                            m.d.sync += o_count.eq(6)
+                            m.d.sync += command_response_length.eq(self.i_stream.payload[:4])
                             m.next = "Command-Wait-For-Ready"
+                        with m.Case(SdSpiCommand.ReadBlock):
+                            m.next = "Read-Count-0:8"
 
             with m.State("Read-Count-0:8"):
                 m.d.comb += self.i_stream.ready.eq(1)
@@ -234,10 +239,12 @@ class SdSpiControllerComponent(wiring.Component):
                     with m.Switch(command):
                         with m.Case(SdSpiCommand.Transfer):
                             m.next = "Transfer"
-                        with m.Case(SdSpiCommand.Delay):
-                            m.next = "Delay"
                         with m.Case(SdSpiCommand.WakeUp):
                             m.next = "WakeUp"
+                        with m.Case(SdSpiCommand.ReadBlock):
+                            m.d.sync += should_tx.eq(1)
+                            m.d.sync += wait_for_ready_count.eq(10000)
+                            m.next = "Data-Block-Wait-For-Ready"
 
             with m.State("Transfer"):
                 m.d.comb += [
@@ -263,15 +270,6 @@ class SdSpiControllerComponent(wiring.Component):
                 with m.If((o_count == 0) & ((i_count == 0) | ~is_get)):
                     m.next = "Read-Command"
 
-            with m.State("Delay"):
-                with m.If(i_count == 0):
-                    m.next = "Read-Command"
-                with m.Elif(timer == 0):
-                    m.d.sync += i_count.eq(i_count - 1)
-                    m.d.sync += timer.eq(self._us_cycles - 1)
-                with m.Else():
-                    m.d.sync += timer.eq(timer - 1)
-
             with m.State("Sync"):
                 m.d.comb += self.o_stream.valid.eq(1)
                 with m.If(self.o_stream.ready):
@@ -283,6 +281,7 @@ class SdSpiControllerComponent(wiring.Component):
                     ctrl.i_stream.p.mode.eq(spi.Mode.Dummy),
                     ctrl.i_stream.p.data.eq(0xFF),
                 ]
+
                 with m.If(o_count != 0):
                     m.d.comb += ctrl.i_stream.valid.eq(1)
                     with m.If(ctrl.i_stream.valid & ctrl.i_stream.ready):
@@ -298,22 +297,27 @@ class SdSpiControllerComponent(wiring.Component):
                 ]
 
                 with m.If(should_tx):
+                    m.d.sync += should_tx.eq(0)
+                    m.d.sync += pending_tx.eq(1)
+                    m.d.sync += pending_rx.eq(1)
+                with m.Elif(~pending_tx & ~pending_rx):
+                    with m.If(wait_for_ready_count == 0):
+                        m.next = "Command-Transmit"
+                    with m.Else():
+                        m.d.sync += should_tx.eq(1)
+
+                with m.If(pending_tx):
                     m.d.comb += ctrl.i_stream.valid.eq(1)
                     with m.If(ctrl.i_stream.valid & ctrl.i_stream.ready):
-                        m.d.sync += should_tx.eq(0)
+                        m.d.sync += pending_tx.eq(0)
 
-                with m.If(i_count != 0):
+                with m.If(pending_rx):
                     m.d.comb += ctrl.o_stream.ready.eq(1)
                     with m.If(ctrl.o_stream.valid & ctrl.o_stream.ready):
-                        m.d.sync += i_count.eq(i_count - 1)
+                        m.d.sync += pending_rx.eq(0)
+                        m.d.sync += wait_for_ready_count.eq(wait_for_ready_count - 1)
                         with m.If(ctrl.o_stream.p.data == 0xFF):
-                            m.d.sync += i_count.eq(0)
-                        with m.Elif(i_count > 1):
-                            m.d.sync += should_tx.eq(1)
-
-                with m.If(i_count == 0):
-                    m.d.sync += o_count.eq(6)
-                    m.next = "Command-Transmit"
+                            m.d.sync += wait_for_ready_count.eq(0)
 
             with m.State("Command-Transmit"):
                 m.d.comb += [
@@ -321,41 +325,155 @@ class SdSpiControllerComponent(wiring.Component):
                     ctrl.i_stream.p.mode.eq(spi.Mode.Put),
                     ctrl.i_stream.p.data.eq(self.i_stream.payload),
                 ]
+
                 with m.If(o_count != 0):
                     m.d.comb += ctrl.i_stream.valid.eq(self.i_stream.valid)
                     m.d.comb += self.i_stream.ready.eq(ctrl.i_stream.ready)
                     with m.If(ctrl.i_stream.valid & ctrl.i_stream.ready):
                         m.d.sync += o_count.eq(o_count - 1)
                 with m.If(o_count == 0):
-                    m.d.sync += o_count.eq(1)
-                    m.d.sync += i_count.eq(1)
                     m.d.sync += should_tx.eq(1)
-                    m.next = "Command-Receive"
+                    m.d.sync += wait_for_ready_count.eq(8)
+                    m.next = "Command-Receive-R1"
 
-            with m.State("Command-Receive"):
+            with m.State("Command-Receive-R1"):
                 m.d.comb += [
                     ctrl.i_stream.p.chip.eq(chip),
                     ctrl.i_stream.p.mode.eq(spi.Mode.Swap),
                     ctrl.i_stream.p.data.eq(0xFF),
                     self.o_stream.payload.eq(ctrl.o_stream.p.data),
                 ]
+
                 with m.If(should_tx):
+                    m.d.sync += should_tx.eq(0)
+                    m.d.sync += pending_tx.eq(1)
+                    m.d.sync += pending_rx.eq(1)
+                with m.Elif(~pending_tx & ~pending_rx):
+                    with m.If(success):
+                        m.d.sync += success.eq(0)
+                        with m.If(command_response_length > 0):
+                            m.d.sync += o_count.eq(command_response_length)
+                            m.d.sync += i_count.eq(command_response_length)
+                            m.next = "Command-Receive-Data"
+                        with m.Else():
+                            m.next = "Read-Command"
+                    with m.Elif(wait_for_ready_count == 0):
+                        m.d.comb += self.o_stream.valid.eq(1)
+                        m.d.comb += self.o_stream.payload.eq(0xFF)
+                        with m.If(self.o_stream.ready):
+                            m.next = "Read-Command"
+                    with m.Else():
+                        m.d.sync += should_tx.eq(1)
+
+                with m.If(pending_tx):
                     m.d.comb += ctrl.i_stream.valid.eq(1)
                     with m.If(ctrl.i_stream.valid & ctrl.i_stream.ready):
-                        m.d.sync += should_tx.eq(0)
-                with m.If(i_count != 0):
+                        m.d.sync += pending_tx.eq(0)
+
+                with m.If(pending_rx):
                     with m.If(ctrl.o_stream.valid):
+                        with m.If(ctrl.o_stream.ready):
+                            m.d.sync += pending_rx.eq(0)
+                            m.d.sync += wait_for_ready_count.eq(wait_for_ready_count - 1)
+
                         with m.If((ctrl.o_stream.p.data & 0x80) == 0):
                             m.d.comb += ctrl.o_stream.ready.eq(self.o_stream.ready)
                             m.d.comb += self.o_stream.valid.eq(ctrl.o_stream.valid)
-                            with m.If(ctrl.o_stream.valid & ctrl.o_stream.ready):
-                                m.d.sync += i_count.eq(i_count - 1)
-                                with m.If(i_count > 1):
-                                    m.d.sync += should_tx.eq(1)
+                            with m.If(ctrl.o_stream.ready):
+                                m.d.sync += success.eq(1)
                         with m.Else():
                             m.d.comb += ctrl.o_stream.ready.eq(1)
-                            m.d.sync += should_tx.eq(1)
-                with m.If(i_count == 0):
+
+            with m.State("Command-Receive-Data"):
+                m.d.comb += [
+                    ctrl.i_stream.p.chip.eq(chip),
+                    ctrl.i_stream.p.mode.eq(spi.Mode.Swap),
+                    ctrl.i_stream.p.data.eq(0xFF),
+                    self.o_stream.payload.eq(ctrl.o_stream.p.data),
+                ]
+
+                with m.If(o_count != 0):
+                    m.d.comb += ctrl.i_stream.valid.eq(1)
+                    with m.If(ctrl.i_stream.valid & ctrl.i_stream.ready):
+                        m.d.sync += o_count.eq(o_count - 1)
+
+                with m.If(i_count != 0):
+                    m.d.comb += self.o_stream.valid.eq(ctrl.o_stream.valid)
+                    m.d.comb += ctrl.o_stream.ready.eq(self.o_stream.ready)
+                    with m.If(ctrl.o_stream.valid & ctrl.o_stream.ready):
+                        m.d.sync += i_count.eq(i_count - 1)
+
+                with m.If((o_count == 0) & (i_count == 0)):
+                    m.next = "Read-Command"
+
+            with m.State("Data-Block-Wait-For-Ready"):
+                m.d.comb += [
+                    ctrl.i_stream.p.chip.eq(chip),
+                    ctrl.i_stream.p.mode.eq(spi.Mode.Swap),
+                    ctrl.i_stream.p.data.eq(0xFF),
+                    self.o_stream.payload.eq(ctrl.o_stream.p.data),
+                ]
+
+                with m.If(should_tx):
+                    m.d.sync += should_tx.eq(0)
+                    m.d.sync += pending_tx.eq(1)
+                    m.d.sync += pending_rx.eq(1)
+                with m.Elif(~pending_tx & ~pending_rx):
+                    with m.If(success):
+                        m.d.sync += success.eq(0)
+                        m.next = "Data-Block-Receive-Data"
+                    with m.Elif(wait_for_ready_count == 0):
+                        m.next = "Read-Command"
+                    with m.Else():
+                        m.d.sync += should_tx.eq(1)
+
+                with m.If(pending_tx):
+                    m.d.comb += ctrl.i_stream.valid.eq(1)
+                    with m.If(ctrl.i_stream.valid & ctrl.i_stream.ready):
+                        m.d.sync += pending_tx.eq(0)
+
+                with m.If(pending_rx):
+                    with m.If(ctrl.o_stream.valid):
+                        with m.If(ctrl.o_stream.ready):
+                            m.d.sync += pending_rx.eq(0)
+                            m.d.sync += wait_for_ready_count.eq(wait_for_ready_count - 1)
+
+                        with m.If(ctrl.o_stream.p.data == 0xFE):
+                            m.d.comb += ctrl.o_stream.ready.eq(self.o_stream.ready)
+                            m.d.comb += self.o_stream.valid.eq(ctrl.o_stream.valid)
+                            with m.If(ctrl.o_stream.ready):
+                                m.d.sync += success.eq(1)
+                        with m.Elif((ctrl.o_stream.p.data[4:] == 0) & (ctrl.o_stream.p.data[:4] != 0)):
+                            m.d.comb += ctrl.o_stream.ready.eq(self.o_stream.ready)
+                            m.d.comb += self.o_stream.valid.eq(ctrl.o_stream.valid)
+                            with m.If(ctrl.o_stream.ready):
+                                m.d.sync += wait_for_ready_count.eq(0)
+                        with m.Elif(wait_for_ready_count == 1):
+                            m.d.comb += ctrl.o_stream.ready.eq(self.o_stream.ready)
+                            m.d.comb += self.o_stream.valid.eq(ctrl.o_stream.valid)
+                        with m.Else():
+                            m.d.comb += ctrl.o_stream.ready.eq(1)
+
+            with m.State("Data-Block-Receive-Data"):
+                m.d.comb += [
+                    ctrl.i_stream.p.chip.eq(chip),
+                    ctrl.i_stream.p.mode.eq(spi.Mode.Swap),
+                    ctrl.i_stream.p.data.eq(0xFF),
+                    self.o_stream.payload.eq(ctrl.o_stream.p.data),
+                ]
+
+                with m.If(o_count != 0):
+                    m.d.comb += ctrl.i_stream.valid.eq(1)
+                    with m.If(ctrl.i_stream.valid & ctrl.i_stream.ready):
+                        m.d.sync += o_count.eq(o_count - 1)
+
+                with m.If(i_count != 0):
+                    m.d.comb += self.o_stream.valid.eq(ctrl.o_stream.valid)
+                    m.d.comb += ctrl.o_stream.ready.eq(self.o_stream.ready)
+                    with m.If(ctrl.o_stream.valid & ctrl.o_stream.ready):
+                        m.d.sync += i_count.eq(i_count - 1)
+
+                with m.If((o_count == 0) & (i_count == 0)):
                     m.next = "Read-Command"
 
         return m
@@ -374,47 +492,35 @@ class SdSpiInterface:
     ):
         self._logger = logger
         self._level = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
-        self._ident = "SD SPI"
 
         ports = assembly.add_port_group(cs=cs, sck=sck, copi=copi, cipo=cipo)
-        component = assembly.add_submodule(
-            SdSpiControllerComponent(
-                ports, us_cycles=int(1 / (assembly.sys_clk_period * 1_000_000))
-            )
-        )
+        component = assembly.add_submodule(SdSpiControllerComponent(ports, us_cycles=int(1 / (assembly.sys_clk_period * 1_000_000))))
         self._pipe = assembly.add_inout_pipe(component.o_stream, component.i_stream)
-        self._clock = assembly.add_clock_divisor(
-            component.divisor, ref_period=assembly.sys_clk_period, name="sck"
-        )
+        self._clock = assembly.add_clock_divisor(component.divisor, ref_period=assembly.sys_clk_period, name="sck")
 
         self._active = None
 
     def _log(self, message, *args):
-        self._logger.log(self._level, self._ident + ": " + message, *args)
+        self._logger.log(self._level, message, *args)
+
+    def _log_trace(self, message, *args):
+        self._logger.log(logging.TRACE, message, *args)
 
     @property
     def clock(self) -> ClockDivisor:
         return self._clock
 
-    @staticmethod
-    def _chunked(items, *, count=0xFFFF):
-        while items:
-            yield items[:count]
-            items = items[count:]
-
     @contextlib.asynccontextmanager
-    async def select(self, index=0):
+    async def _select(self, index=0):
         assert self._active is None, "chip already selected"
         assert index in range(8)
         try:
-            self._log("select chip=%d", index)
-            await self._pipe.send(
-                struct.pack("<B", (SdSpiCommand.Select.value << 4) | (1 + index))
-            )
+            self._log_trace("select chip=%d", index)
+            await self._pipe.send(struct.pack("<B", (SdSpiCommand.Select.value << 4) | (1 + index)))
             self._active = index
             yield
         finally:
-            self._log("deselect")
+            self._log_trace("deselect")
             await self._pipe.send(
                 struct.pack(
                     "<BBH",
@@ -426,215 +532,110 @@ class SdSpiInterface:
             await self._pipe.flush()
             self._active = None
 
-    async def exchange(self, octets: bytes | bytearray | memoryview) -> memoryview:
-        assert self._active is not None, "no chip selected"
-        self._log("xchg-o=<%s>", dump_hex(octets))
-        for chunk in self._chunked(octets):
-            await self._pipe.send(
-                struct.pack(
-                    "<BH",
-                    (SdSpiCommand.Transfer.value << 4) | spi.Mode.Swap.value,
-                    len(chunk),
-                )
-            )
-            await self._pipe.send(chunk)
-        await self._pipe.flush()
-        octets = await self._pipe.recv(len(octets))
-        self._log("xchg-i=<%s>", dump_hex(octets))
-        return octets
-
-    async def write(self, octets: bytes | bytearray | memoryview):
-        assert self._active is not None, "no chip selected"
-        self._log("write=<%s>", dump_hex(octets))
-        for chunk in self._chunked(octets):
-            await self._pipe.send(
-                struct.pack(
-                    "<BH",
-                    (SdSpiCommand.Transfer.value << 4) | spi.Mode.Put.value,
-                    len(chunk),
-                )
-            )
-            await self._pipe.send(chunk)
-
-    async def read(self, count: int) -> memoryview:
-        assert self._active is not None, "no chip selected"
-        for chunk in self._chunked(range(count)):
-            await self._pipe.send(
-                struct.pack(
-                    "<BH",
-                    (SdSpiCommand.Transfer.value << 4) | spi.Mode.Get.value,
-                    len(chunk),
-                )
-            )
-        await self._pipe.flush()
-        octets = await self._pipe.recv(count)
-        self._log("read=<%s>", dump_hex(octets))
-        return octets
-
-    async def dummy(self, count: int):
-        # We intentionally allow sending dummy cycles with no chip selected.
-        self._log("dummy=%d", count)
-        for chunk in self._chunked(range(count)):
-            await self._pipe.send(
-                struct.pack(
-                    "<BH",
-                    (SdSpiCommand.Transfer.value << 4) | spi.Mode.Dummy.value,
-                    len(chunk),
-                )
-            )
-
-    async def delay_us(self, duration: int):
-        self._log("delay us=%d", duration)
-        for chunk in self._chunked(range(duration)):
-            await self._pipe.send(
-                struct.pack("<BH", (SdSpiCommand.Delay.value << 4), len(chunk))
-            )
-
-    async def delay_ms(self, duration: int):
-        self._log("delay ms=%d", duration)
-        for chunk in self._chunked(range(duration * 1000)):
-            await self._pipe.send(
-                struct.pack("<BH", (SdSpiCommand.Delay.value << 4), len(chunk))
-            )
-
-    async def synchronize(self):
-        self._log("sync-o")
+    async def _synchronize(self):
+        self._log_trace("sync-o")
         await self._pipe.send(struct.pack("<B", (SdSpiCommand.Sync.value << 4)))
         await self._pipe.flush()
         await self._pipe.recv(1)
-        self._log("sync-i")
+        self._log_trace("sync-i")
 
-    async def wakeup(self):
+    async def _wakeup(self, cycles=74):
         """Wake up the SD card by sending 74 clock cycles."""
-        self._log("Waking up SD card")
-        await self._pipe.send(struct.pack("<BH", (SdSpiCommand.WakeUp.value << 4), 74))
-        await self.synchronize()
+        self._log_trace("wakeup cycles=%d", cycles)
+        await self._pipe.send(struct.pack("<BH", (SdSpiCommand.WakeUp.value << 4), cycles))
+        await self._synchronize()
 
-        async with self.select():
-            await self._pipe.send(
-                struct.pack(
-                    "<B6s",
-                    (SdSpiCommand.Command.value << 4),
-                    b"\x40\x00\x00\x00\x00\x95",
-                )
+    async def _command_internal(self, command, argument=0, response_length=0) -> tuple[int, memoryview]:
+        """Send a command without selecting a chip."""
+        self._log_trace("command_internal: cmd=%d arg=%08X rsp_len=%d", command, argument, response_length)
+        assert self._active is not None, "no chip selected"
+
+        command_bytes = bytes(
+            [
+                0x40 | (command & 0x3F),
+                (argument >> 24) & 0xFF,
+                (argument >> 16) & 0xFF,
+                (argument >> 8) & 0xFF,
+                argument & 0xFF,
+            ]
+        )
+        command_crc = (crc7(command_bytes) << 1) | 1
+
+        await self._pipe.send(
+            struct.pack(
+                "<B5sB",
+                (SdSpiCommand.Command.value << 4) | response_length,
+                command_bytes,
+                command_crc,
             )
+        )
+        await self._pipe.flush()
 
-        response = await self._pipe.recv(1)
-
-        self._log("CMD0 response: %s", response.hex())
-        self._log("Woke up SD card")
-
-    async def _read_byte(self):
-        """Read a single byte from the SD card."""
-        result = await self.exchange([0xFF])
-        return result[0]
-
-    async def _read_bytes(self, length):
-        """Read multiple bytes from the SD card."""
-        result = await self.exchange([0xFF] * length)
-        return bytes(result)
-
-    async def _wakeup(self):
-        """Wake up the SD card by sending 74 clock cycles."""
-        async with self.select():
-            await self.dummy(74)
-
-    async def _wait_until_ready(self):
-        """Wait until the SD card is ready."""
-        for _ in range(8):
-            status = await self._read_byte()
-            if status == 0xFF:
-                return
-
-        raise SdSpiError("Timeout waiting for SD card to be ready")
-
-    async def _wait_until_response(self):
-        """Wait until the SD card responds."""
-        for _ in range(8):
-            status = await self._read_byte()
-            if (status & 0x80) == 0:
-                return status
-
-        raise SdSpiError("Timeout waiting for SD card response")
-
-    async def _command_internal(self, command, arg=0, response_length=0):
-        """Send a command to the SD card and return the response, without selecting the SPI interface."""
-        request = [
-            0x40 | (command & 0x3F),
-            (arg >> 24) & 0xFF,
-            (arg >> 16) & 0xFF,
-            (arg >> 8) & 0xFF,
-            arg & 0xFF,
-        ]
-        crc = crc7(request)
-        request_with_crc = request + [(crc << 1) | 1]
-
-        await self._wait_until_ready()
-        await self.write(request_with_crc)
-        status = await self._wait_until_response()
-
-        if status > 1:
-            raise SdSpiError(f"Command {command} failed with status {status}")
-
-        if response_length > 0:
-            response = await self._read_bytes(response_length)
+        response_r1 = (await self._pipe.recv(1))[0]
+        if (response_r1 & 0x80) == 0 and response_length > 0:
+            response_data = await self._pipe.recv(response_length)
+            return response_r1, bytes(response_data)
         else:
-            response = bytes()
+            return response_r1, None
 
-        return status, response
+    async def _read_data_block(self, data_block_length) -> tuple[int, memoryview]:
+        """Read a data block without selecting a chip."""
+        assert self._active is not None, "no chip selected"
+        self._log_trace("read_data_block: blk_len=%d", data_block_length)
 
-    async def _command(self, command, arg=0, response_length=0):
-        """Send a command to the SD card and return the response."""
-        async with self.select():
-            status, response = await self._command_internal(
-                command, arg, response_length
+        await self._pipe.send(
+            struct.pack(
+                "<BH",
+                (SdSpiCommand.ReadBlock.value << 4),
+                data_block_length + 2,
             )
+        )
+        await self._pipe.flush()
 
-        return status, response
+        data_start_token = (await self._pipe.recv(1))[0]
+        self._log_trace("data start token: %02X", data_start_token)
+        if data_start_token != 0xFE:
+            return data_start_token, None
 
-    async def _app_command(self, command, arg=0, response_length=0):
-        """Send an application-specific command to the SD card."""
+        block_data_and_crc = await self._pipe.recv(data_block_length + 2)
+        self._log_trace("block data and crc: %s", block_data_and_crc.hex())
+
+        block_data = block_data_and_crc[:-2]
+        block_crc = (block_data_and_crc[-2] << 8) | block_data_and_crc[-1]
+        calculated_crc = crc16(block_data)
+        if block_crc != calculated_crc:
+            raise SdSpiError(f"CRC mismatch: expected {calculated_crc} got {block_crc}")
+
+        return data_start_token, block_data
+
+    async def _command(self, command, argument=0, response_length=0) -> tuple[int, memoryview | None]:
+        self._log_trace("command: cmd=%d arg=%08X rsp_len=%d", command, argument, response_length)
+
+        async with self._select():
+            response_r1, response_data = await self._command_internal(command, argument, response_length)
+
+        return response_r1, response_data
+
+    async def _app_command(self, command, argument=0, response_length=0) -> tuple[int, memoryview | None]:
+        self._log_trace("app_command: cmd=%d arg=%08X rsp_len=%d", command, argument, response_length)
+
         status, _ = await self._command(55)
         if status > 1:
             raise SdSpiError(f"App command prefix failed with status {status}")
 
-        return await self._command(command, arg, response_length)
+        return await self._command(command, argument, response_length)
 
-    async def _read_data_block(self, length) -> bytes:
-        """Read a data block of the specified length from the SD card."""
-        # Wait for data token (0xFE)
-        for _ in range(10000):
-            token = await self._read_byte()
-            if token == 0xFE:
-                break
-        else:
-            raise SdSpiError("Timeout waiting for data token")
+    async def _command_with_data_block(self, command, argument=0, response_length=0, data_block_length=512) -> tuple[int, memoryview | None, int, memoryview | None]:
+        self._log_trace("command_with_data_block: cmd=%d arg=%08X rsp_len=%d data_len=%d", command, argument, response_length, data_block_length)
 
-        data_and_crc = await self._read_bytes(length + 2)
+        async with self._select():
+            response_r1, response_data = await self._command_internal(command, argument, response_length)
+            if response_r1 > 1:
+                return response_r1, None, None, None
 
-        data = data_and_crc[:-2]
-        crc = (data_and_crc[-2] << 8) | data_and_crc[-1]
-        calculated_crc = crc16(data)
-        if crc != calculated_crc:
-            raise SdSpiError(
-                f"CRC mismatch: received {crc:04x}, calculated {calculated_crc:04x}"
-            )
+            data_start_token, block_data = await self._read_data_block(data_block_length)
 
-        return bytes(data)
-
-    async def _command_with_data_block(
-        self, command, arg=0, response_length=0, data_block_length=512
-    ) -> bytes:
-        """Send a command that expects a data block response."""
-        async with self.select():
-            status, _ = await self._command_internal(command, arg, response_length)
-
-            if status != 0:
-                raise SdSpiError(f"Command {command} failed with status {status}")
-
-            data = await self._read_data_block(data_block_length)
-
-        return data
+        return response_r1, response_data, data_start_token, block_data
 
     async def initialize(self) -> SdCardVersion:
         """Initialize the SD card."""
@@ -648,51 +649,48 @@ class SdSpiInterface:
         self._log("CMD0: GO_IDLE_STATE -> OK")
 
         # CMD8: SEND_IF_COND
-        status, response = await self._command(8, arg=0x000001AA, response_length=4)
+        status, response = await self._command(8, argument=0x000001AA, response_length=4)
         if status == 5:
             self._log("CMD8: SEND_IF_COND -> Illegal command (SD v1.x or MMC)")
             sd_version = 1
         elif status == 1:
             if response != bytes([0x00, 0x00, 0x01, 0xAA]):
-                raise SdSpiError(
-                    f"CMD8: SEND_IF_COND -> Invalid response {response.hex()}"
-                )
+                raise SdSpiError(f"CMD8: SEND_IF_COND -> Invalid response {response.hex()}")
             self._log("CMD8: SEND_IF_COND -> OK (SD v2.x)")
             sd_version = 2
         else:
             raise SdSpiError(f"CMD8: SEND_IF_COND failed with status {status}")
 
         # ACMD41: SD_SEND_OP_COND (with HCS bit for SD v2.x)
-        arg = 0x40000000 if sd_version == 2 else 0x00000000
+        argument = 0x40000000 if sd_version == 2 else 0x00000000
         for _ in range(100):
-            status, _ = await self._app_command(41, arg=arg)
+            status, _ = await self._app_command(41, argument=argument)
             if status == 0:
                 break
         else:
-            raise SdSpiError(
-                "ACMD41: SD_SEND_OP_COND -> Timeout waiting for card to be ready"
-            )
+            raise SdSpiError("ACMD41: SD_SEND_OP_COND -> Timeout waiting for card to be ready")
         self._log("ACMD41: SD_SEND_OP_COND -> OK")
 
         # CMD58: READ_OCR
         status, ocr = await self._command(58, response_length=4)
         if status != 0:
             raise SdSpiError(f"CMD58: READ_OCR failed with status {status}")
-        self._log(f"CMD58: READ_OCR -> OK, OCR={ocr.hex()}")
+        self._log("CMD58: READ_OCR -> OK, OCR=%s", dump_hex(ocr))
 
         if sd_version == 2 and (ocr[0] & 0x40):
-            self._log("Card is SDHC/SDXC")
             return SdCardVersion.SDHC
         elif sd_version == 2:
-            self._log("Card is SDSC (v2.x)")
             return SdCardVersion.SDV2
         else:
-            self._log("Card is SDSC (v1.x)")
             return SdCardVersion.SDV1
 
     async def read_card_specific_data(self):
         """Read the card specific data (CSD) from the SD card."""
-        data = await self._command_with_data_block(9, data_block_length=16)
+        status, _, data_start_token, data = await self._command_with_data_block(9, data_block_length=16)
+        if status != 0:
+            raise SdSpiError(f"CMD9: SEND_CSD failed with status {status}")
+        if data_start_token != 0xFE:
+            raise SdSpiError(f"CMD9: SEND_CSD failed with data start token {data_start_token}")
 
         data_rev = bytes(reversed(data))
         calculated_checksum = crc7(data[:15])
@@ -707,13 +705,17 @@ class SdSpiInterface:
         else:
             raise SdSpiError("Unknown CSD version")
 
-        self._log(f"CSD: {data.hex()}")
+        self._log("CSD: %s", dump_hex(data))
 
         return csd
 
     async def read_card_identification(self):
         """Read the card identification (CID) from the SD card."""
-        data = await self._command_with_data_block(10, data_block_length=16)
+        status, _, data_start_token, data = await self._command_with_data_block(10, data_block_length=16)
+        if status != 0:
+            raise SdSpiError(f"CMD10: SEND_CID failed with status {status}")
+        if data_start_token != 0xFE:
+            raise SdSpiError(f"CMD10: SEND_CID failed with data start token {data_start_token}")
 
         data_rev = bytes(reversed(data))
         calculated_checksum = crc7(data[:15])
@@ -721,16 +723,20 @@ class SdSpiInterface:
         if cid.checksum != calculated_checksum:
             raise SdSpiError("Invalid checksum for SdCardIdentification")
 
-        self._log(f"CID: {data.hex()}")
+        self._log("CID: %s", dump_hex(data))
 
         return cid
 
     async def read_block(self, address: int) -> bytes:
         """Read a 512-byte block from the SD card at the specified address."""
         self._log(f"Reading block at address {address:#x}")
-        data = await self._command_with_data_block(
-            17, arg=address, data_block_length=512
-        )
+        status, _, data_start_token, data = await self._command_with_data_block(17, argument=address, data_block_length=512)
+
+        if status != 0:
+            raise SdSpiError(f"CMD17: READ_SINGLE_BLOCK failed with status {status}")
+        if data_start_token != 0xFE:
+            raise SdSpiError(f"CMD17: READ_SINGLE_BLOCK failed with data start token {data_start_token}")
+
         self._log(f"Read block at address {address:#x} -> OK")
         return data
 
@@ -738,23 +744,27 @@ class SdSpiInterface:
         """Read multiple 512-byte blocks from the SD card starting at the specified address."""
         self._log(f"Reading {count} blocks starting at address {start_block:#x}")
 
-        async with self.select():
+        async with self._select():
             status, _ = await self._command_internal(18, start_block)
             if status != 0:
-                raise SdSpiError(f"CMD failed with status {status}")
+                raise SdSpiError(f"CMD18: READ_MULTIPLE_BLOCK failed with status {status}")
 
-            data = bytearray()
+            total_data = bytearray()
             for block_index in range(count):
-                data.extend(await self._read_data_block(512))
+                data_start_token, data = await self._read_data_block(512)
+                if data_start_token != 0xFE:
+                    raise SdSpiError(f"CMD18: READ_MULTIPLE_BLOCK failed with data start token {data_start_token}")
+
+                total_data.extend(data)
                 print(f"\rRead block {start_block + block_index} -> OK", end="")
 
             status, _ = await self._command_internal(12)
             if status != 0:
-                raise SdSpiError(f"CMD12 failed with status {status}")
+                raise SdSpiError(f"CMD12: STOP_TRANSMISSION failed with status {status}")
 
             print("\r", end="")
 
-        return bytes(data)
+        return bytes(total_data)
 
 
 class MemorySdSpiApplet(GlasgowAppletV2):
@@ -783,56 +793,33 @@ class MemorySdSpiApplet(GlasgowAppletV2):
                 copi=args.copi,
                 cipo=args.cipo,
             )
-        # with self.assembly.add_applet(self):
-        #     self.assembly.use_voltage(args.voltage)
-        #     self.spi_iface = SPIControllerInterface(
-        #         self.logger,
-        #         self.assembly,
-        #         cs=args.cs,
-        #         sck=args.sck,
-        #         copi=args.copi,
-        #         cipo=args.cipo,
-        #         mode=3,
-        #     )
-        #     self.sd_spi_iface = SdSpiInterface(self.logger, self.spi_iface)
+
+    @classmethod
+    def add_setup_arguments(cls, parser):
+        parser.add_argument("-f", "--frequency", metavar="FREQ", type=int, default=500, help="set start-up SCK frequency to FREQ kHz (default: %(default)s)")
+        parser.add_argument("-x", "--high-frequency", metavar="FREQ", type=int, default=4800, help="set high SCK frequency to FREQ kHz (default: %(default)s)")
 
     async def setup(self, args):
-        # await self.spi_iface.clock.set_frequency(500e3)
-        await self.sd_spi_iface.clock.set_frequency(500e3)
+        await self.sd_spi_iface.clock.set_frequency(args.frequency * 1000)
+        self.high_frequency = args.high_frequency * 1000
 
     @classmethod
     def add_run_arguments(cls, parser):
-        p_operation = parser.add_subparsers(
-            dest="operation", metavar="OPERATION", required=True
-        )
-
-        p_test = p_operation.add_parser("test", help="test the SD card interface")
+        p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION", required=True)
 
         p_identify = p_operation.add_parser("identify", help="identify the SD card")
 
         p_read = p_operation.add_parser("read", help="read data from the SD card")
-        p_read.add_argument(
-            "block_address", type=int, help="block address to read from"
-        )
+        p_read.add_argument("block_address", type=lambda x: int(x, 0), help="block address to read from")
 
-        p_read_multiple = p_operation.add_parser(
-            "read-multiple", help="read multiple blocks from the SD card"
-        )
-        p_read_multiple.add_argument(
-            "block_address", type=int, help="block address to read from"
-        )
-        p_read_multiple.add_argument("count", type=int, help="number of blocks to read")
+        p_read_multiple = p_operation.add_parser("read-multiple", help="read multiple blocks from the SD card")
+        p_read_multiple.add_argument("block_address", type=lambda x: int(x, 0), help="block address to read from")
+        p_read_multiple.add_argument("count", type=lambda x: int(x, 0), help="number of blocks to read")
 
     async def run(self, args):
         try:
-            if args.operation == "test":
-                self.logger.info("Testing SD card interface")
-                await self.sd_spi_iface.wakeup()
-                await self.sd_spi_iface.synchronize()
-
-                return
-
             sd_card_version = await self.sd_spi_iface.initialize()
+            await self.sd_spi_iface.clock.set_frequency(self.high_frequency)
 
             if args.operation == "identify":
                 card_identification = await self.sd_spi_iface.read_card_identification()
@@ -848,141 +835,78 @@ class MemorySdSpiApplet(GlasgowAppletV2):
 
                 self.logger.info("")
                 self.logger.info("SD Card Identification (CID):")
-                self.logger.info(
-                    f"    Manufacturer ID: 0x{card_identification.manufacturer_id:02x}"
-                )
-                self.logger.info(
-                    f"    OEM/Application ID: '{bytes(reversed(bits(card_identification.oem_application_id).to_bytes())).decode('ascii')}'"
-                )
-                self.logger.info(
-                    f"    Product name: '{bytes(reversed(bits(card_identification.product_name).to_bytes())).decode('ascii')}'"
-                )
-                self.logger.info(
-                    f"    Product revision: {card_identification.product_revision_major}.{card_identification.product_revision_minor}"
-                )
-                self.logger.info(
-                    f"    Product serial number: {card_identification.product_serial_number}"
-                )
-                self.logger.info(
-                    f"    Manufacturing date: {card_identification.manufacturing_month:02}-{2000 + card_identification.manufacturing_year:04}"
-                )
+                self.logger.info(f"    Manufacturer ID: 0x{card_identification.manufacturer_id:02x}")
+                self.logger.info(f"    OEM/Application ID: '{bytes(reversed(bits(card_identification.oem_application_id).to_bytes())).decode('ascii')}'")
+                self.logger.info(f"    Product name: '{bytes(reversed(bits(card_identification.product_name).to_bytes())).decode('ascii')}'")
+                self.logger.info(f"    Product revision: {card_identification.product_revision_major}.{card_identification.product_revision_minor}")
+                self.logger.info(f"    Product serial number: {card_identification.product_serial_number}")
+                self.logger.info(f"    Manufacturing date: {card_identification.manufacturing_month:02}-{2000 + card_identification.manufacturing_year:04}")
 
                 self.logger.info("")
                 self.logger.info("SD Card Specific Data (CSD):")
 
                 if card_specific_data.version == 0:
-                    self.logger.info(
-                        f"    Data read access time: {card_specific_data.data_read_access_time_1:07b}"
-                    )
-                    self.logger.info(
-                        f"    Data read access time in CLK cycles: {100 * card_specific_data.data_read_access_time_2}"
-                    )
+                    self.logger.info(f"    Data read access time: {card_specific_data.data_read_access_time_1:07b}")
+                    self.logger.info(f"    Data read access time in CLK cycles: {100 * card_specific_data.data_read_access_time_2}")
 
-                self.logger.info(
-                    f"    Max data transfer rate: {card_specific_data.max_data_transfer_rate // 2}MHz"
-                )
-                self.logger.info(
-                    f"    Card command class: {card_specific_data.card_command_class:012b}"
-                )
+                self.logger.info(f"    Max data transfer rate: {card_specific_data.max_data_transfer_rate // 2}MHz")
+                self.logger.info(f"    Card command class: {card_specific_data.card_command_class:012b}")
 
                 if card_specific_data.version == 0:
-                    self.logger.info(
-                        f"    Max read data block length: {2 ** card_specific_data.max_read_data_block_length}"
-                    )
-                    self.logger.info(
-                        f"    Partial blocks for read allowed: {card_specific_data.partial_blocks_for_read_allowed}"
-                    )
-                    self.logger.info(
-                        f"    Write block misalignment: {card_specific_data.write_block_misalignment}"
-                    )
-                    self.logger.info(
-                        f"    Read block misalignment: {card_specific_data.read_block_misalignment}"
-                    )
+                    self.logger.info(f"    Max read data block length: {2 ** card_specific_data.max_read_data_block_length}")
+                    self.logger.info(f"    Partial blocks for read allowed: {card_specific_data.partial_blocks_for_read_allowed}")
+                    self.logger.info(f"    Write block misalignment: {card_specific_data.write_block_misalignment}")
+                    self.logger.info(f"    Read block misalignment: {card_specific_data.read_block_misalignment}")
 
-                self.logger.info(
-                    f"    DSR implemented: {card_specific_data.dsr_implemented}"
-                )
+                self.logger.info(f"    DSR implemented: {card_specific_data.dsr_implemented}")
 
                 if card_specific_data.version == 0:
-                    self.logger.info(
-                        f"    Device size: {card_specific_data.device_size}"
-                    )
-                    self.logger.info(
-                        f"    Max read current @ VDD max: {card_specific_data.max_read_current_vdd_min}"
-                    )
-                    self.logger.info(
-                        f"    Max read current @ VDD max: {card_specific_data.max_read_current_vdd_max}"
-                    )
-                    self.logger.info(
-                        f"    Max write current @ VDD min: {card_specific_data.max_write_current_vdd_min}"
-                    )
-                    self.logger.info(
-                        f"    Max write current @ VDD max: {card_specific_data.max_write_current_vdd_max}"
-                    )
-                    self.logger.info(
-                        f"    Device size multiplier: {card_specific_data.device_size_multiplier}"
-                    )
+                    self.logger.info(f"    Device size: {card_specific_data.device_size}")
+                    self.logger.info(f"    Max read current @ VDD max: {card_specific_data.max_read_current_vdd_min}")
+                    self.logger.info(f"    Max read current @ VDD max: {card_specific_data.max_read_current_vdd_max}")
+                    self.logger.info(f"    Max write current @ VDD min: {card_specific_data.max_write_current_vdd_min}")
+                    self.logger.info(f"    Max write current @ VDD max: {card_specific_data.max_write_current_vdd_max}")
+                    self.logger.info(f"    Device size multiplier: {card_specific_data.device_size_multiplier}")
                 elif card_specific_data.version == 1:
-                    self.logger.info(
-                        f"    Device size: {512 * 1024 * (card_specific_data.device_size + 1)} B ({1024 * (card_specific_data.device_size + 1)} blocks)"
-                    )
+                    self.logger.info(f"    Device size: {512 * 1024 * (card_specific_data.device_size + 1)} B ({1024 * (card_specific_data.device_size + 1)} blocks)")
 
                 if card_specific_data.version == 0:
-                    self.logger.info(
-                        f"    Erase single block enabled: {card_specific_data.erase_single_block_enable}"
-                    )
-                    self.logger.info(
-                        f"    Erase sector size: {card_specific_data.erase_sector_size}"
-                    )
-                    self.logger.info(
-                        f"    Write protect group size: {card_specific_data.write_protect_group_size}"
-                    )
-                    self.logger.info(
-                        f"    Write protect group enable: {card_specific_data.write_protect_group_enable}"
-                    )
-                    self.logger.info(
-                        f"    Write speed factor: {card_specific_data.write_speed_factor}"
-                    )
-                    self.logger.info(
-                        f"    Max write data block length: {2 ** card_specific_data.max_write_data_block_length}"
-                    )
-                    self.logger.info(
-                        f"    Partial blocks for write allowed: {card_specific_data.partial_blocks_for_write_allowed}"
-                    )
-                    self.logger.info(
-                        f"    File format group: {card_specific_data.file_format_group}"
-                    )
+                    self.logger.info(f"    Erase single block enabled: {card_specific_data.erase_single_block_enable}")
+                    self.logger.info(f"    Erase sector size: {card_specific_data.erase_sector_size}")
+                    self.logger.info(f"    Write protect group size: {card_specific_data.write_protect_group_size}")
+                    self.logger.info(f"    Write protect group enable: {card_specific_data.write_protect_group_enable}")
+                    self.logger.info(f"    Write speed factor: {card_specific_data.write_speed_factor}")
+                    self.logger.info(f"    Max write data block length: {2 ** card_specific_data.max_write_data_block_length}")
+                    self.logger.info(f"    Partial blocks for write allowed: {card_specific_data.partial_blocks_for_write_allowed}")
+                    self.logger.info(f"    File format group: {card_specific_data.file_format_group}")
 
                 self.logger.info(f"    Copy flag: {card_specific_data.copy_flag}")
-                self.logger.info(
-                    f"    Permanent write protection: {card_specific_data.permanent_write_protection}"
-                )
-                self.logger.info(
-                    f"    Temporary write protection: {card_specific_data.temporary_write_protection}"
-                )
+                self.logger.info(f"    Permanent write protection: {card_specific_data.permanent_write_protection}")
+                self.logger.info(f"    Temporary write protection: {card_specific_data.temporary_write_protection}")
 
                 if card_specific_data.version == 0:
-                    self.logger.info(
-                        f"    File format: {card_specific_data.file_format}"
-                    )
+                    self.logger.info(f"    File format: {card_specific_data.file_format}")
+
             elif args.operation == "read":
-                self.logger.info(f"Reading from address {args.block_address:#x}")
+                self.logger.info(f"Reading single block from address {args.block_address:#x}")
                 data = await self.sd_spi_iface.read_block(args.block_address)
                 print(data.hex())
                 with open(f"sd_block_{args.block_address:08x}.bin", "wb") as f:
                     f.write(data)
-            elif args.operation == "read-multiple":
-                self.logger.info(
-                    f"Reading {args.count} blocks starting from address {args.block_address:#x}"
-                )
-                data = await self.sd_spi_iface.read_blocks(
-                    args.block_address, args.count
-                )
 
-                for offset in range(0, len(data), 32):
-                    chunk = data[offset : offset + 32]
-                    hex_chunk = " ".join(f"{byte:02x}" for byte in chunk)
-                    print(f"{args.block_address * 512 + offset:08x}  {hex_chunk}")
+            elif args.operation == "read-multiple":
+                self.logger.info(f"Reading {args.count} blocks starting at address {args.block_address:#x}")
+
+                start_time = time.time()
+                data = await self.sd_spi_iface.read_blocks(args.block_address, args.count)
+                duration = time.time() - start_time
+
+                bytes_per_second = len(data) / duration
+                max_bytes_per_second = self.high_frequency / 8
+                self.logger.info(f"Read {len(data)} bytes in {duration:.3f} seconds, {bytes_per_second / 1000:.2f} KB/s, usage {100 * bytes_per_second / max_bytes_per_second:.1f}%")
+
+                with open(f"sd_blocks_{args.block_address:08x}_{args.count}.bin", "wb") as f:
+                    f.write(data)
 
         except SdSpiError as e:
             self.logger.error("Error: %s", e)

@@ -16,7 +16,7 @@ class MemorySdSpiAppletTestCase(GlasgowAppletV2TestCase, applet=MemorySdSpiApple
     # def test_build(self):
     #     self.assertBuilds()
 
-    simulation_args = []
+    simulation_args = ["-f", "50"]
 
     def prepare_target(self, assembly: SimulationAssembly):
         ctl_ports = PortGroup(
@@ -43,18 +43,7 @@ class MemorySdSpiAppletTestCase(GlasgowAppletV2TestCase, applet=MemorySdSpiApple
         self.shreg_in = 0
         self.shreg_in_cnt = 0
         self.last_sck = 0
-        self.response_bytes = [
-            0x00,
-            0xFF,
-            0xFF,
-            0xFF,
-            0xFF,
-            0xFF,
-            0xFF,
-            0xFF,
-            0xFF,
-            0x01,
-        ]
+        self.response_bytes = []
         self.shreg_out = 0
         self.shreg_out_cnt = 0
 
@@ -95,4 +84,30 @@ class MemorySdSpiAppletTestCase(GlasgowAppletV2TestCase, applet=MemorySdSpiApple
 
     @applet_v2_simulation_test(prepare=prepare_target, args=simulation_args)
     async def test_wakeup(self, applet: MemorySdSpiApplet, ctx):
-        await applet.sd_spi_iface.wakeup()
+        self.response_bytes = [
+            0x00, 0xFF, # Ready check
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, # Command request CMD0
+            0xFF, 0x01, # Command response
+            0xFF, # Ready check
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, # Command request CMD8
+            0xFF, 0x01, 0x00, 0x00, 0x01, 0xAA, # Command response
+            0xFF, # Ready check
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, # Command request CMD55
+            0xFF, 0x01, # Command response
+            0xFF, # Ready check
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, # Command request ACMD41
+            0xFF, 0x00, # Command response
+            0xFF, # Ready check
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, # Command request CMD58
+            0xFF, 0x00, 0xC0, 0xFF, 0x80, 0x00, # Command response
+        ]
+        await applet.sd_spi_iface.initialize()
+
+    @applet_v2_simulation_test(prepare=prepare_target, args=simulation_args)
+    async def test_wakeup2(self, applet: MemorySdSpiApplet, ctx):
+        self.response_bytes = [
+            0x00, 0xFF, # Ready check
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, # Command request
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF # Command response
+        ]
+        await applet.sd_spi_iface.initialize()

@@ -183,3 +183,6 @@ build-backend = "pdm.backend"
 [tool.pdm.scripts]
 "update-pdm.min.lock".cmd = "pdm lock -L pdm.min.lock -S direct_minimal_versions"
 test.cmd = "python -m unittest"
+
+[tool.black]
+line-length = 300
